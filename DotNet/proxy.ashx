@@ -11,11 +11,13 @@
 #define TRACE
 using System;
 using System.IO;
+using System.Net;
 using System.Web;
 using System.Xml.Serialization;
 using System.Web.Caching;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Configuration;
 
 public class proxy : IHttpHandler {
 
@@ -204,7 +206,7 @@ public class proxy : IHttpHandler {
         //forwarding original request
         System.Net.WebResponse serverResponse = null;
         try {
-            serverResponse = forwardToServer(context, addTokenToUri(uri, token, tokenParamName), postBody);
+            serverResponse = forwardToServer(context, addTokenToUri(uri, token, tokenParamName), postBody, serverUrl.UseProxyServer);
         } catch (System.Net.WebException webExc) {
             
             string errorMsg = webExc.Message + " " + uri;
@@ -254,7 +256,7 @@ public class proxy : IHttpHandler {
                 //server returned error - potential cause: token has expired.
                 //we'll do second attempt to call the server with renewed token:
                 token = getNewTokenIfCredentialsAreSpecified(serverUrl, uri);
-                serverResponse = forwardToServer(context, addTokenToUri(uri, token, tokenParamName), postBody);
+                serverResponse = forwardToServer(context, addTokenToUri(uri, token, tokenParamName), postBody, serverUrl.UseProxyServer);
 
                 //storing the token in Application scope, to do not waste time on requesting new one untill it expires or the app is restarted.
                 context.Application.Lock();
@@ -283,11 +285,11 @@ public class proxy : IHttpHandler {
         return new byte[0];
     }
 
-    private System.Net.WebResponse forwardToServer(HttpContext context, string uri, byte[] postBody) {
+    private System.Net.WebResponse forwardToServer(HttpContext context, string uri, byte[] postBody, bool useProxyServer) {
         return
             postBody.Length > 0?
-            doHTTPRequest(uri, postBody, "POST", context.Request.Headers["referer"], context.Request.ContentType):
-            doHTTPRequest(uri, context.Request.HttpMethod);
+            doHTTPRequest(uri, postBody, "POST", context.Request.Headers["referer"], context.Request.ContentType, useProxyServer) :
+            doHTTPRequest(uri, context.Request.HttpMethod, useProxyServer);
     }
 
     private bool fetchAndPassBackToClient(System.Net.WebResponse serverResponse, HttpResponse clientResponse, bool ignoreAuthenticationErrors) {
@@ -327,7 +329,8 @@ public class proxy : IHttpHandler {
         return false;
     }
 
-    private System.Net.WebResponse doHTTPRequest(string uri, string method) {
+    private System.Net.WebResponse doHTTPRequest(string uri, string method, bool useProxyServer)
+    {
         byte[] bytes = null;
         String contentType = null;
 
@@ -344,23 +347,41 @@ public class proxy : IHttpHandler {
             }
         }
 
-        return doHTTPRequest(uri, bytes, method, PROXY_REFERER, contentType);
+        return doHTTPRequest(uri, bytes, method, PROXY_REFERER, contentType, useProxyServer);
     }
 
-    private System.Net.WebResponse doHTTPRequest(string uri, byte[] bytes, string method, string referer, string contentType) {
+    private System.Net.WebResponse doHTTPRequest(string uri, byte[] bytes, string method, string referer, string contentType, bool useProxyServer)
+    {
         System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(uri);
         req.ServicePoint.Expect100Continue = false;
         req.Referer = referer;
         req.Method = method;
-        if (bytes != null && bytes.Length > 0 || method == "POST") {
+
+        NetworkCredential cred = new NetworkCredential(ConfigurationManager.AppSettings["proxy:ImpersonateUserName"], ConfigurationManager.AppSettings["proxy:ImpersonatePassword"], ConfigurationManager.AppSettings["proxy:ImpersonateDomain"]);
+        if (useProxyServer)
+        {
+            WebProxy webProxy = new WebProxy(ConfigurationManager.AppSettings["proxy:ProxyServerAddress"], Convert.ToBoolean(ConfigurationManager.AppSettings["proxy:ProxyServerBypassOnLocal"]));
+            webProxy.Credentials = cred;
+            req.Proxy = webProxy;
+        }
+        else
+        {
+            req.Credentials = cred;
+            req.PreAuthenticate = true;
+        }
+
+        if (bytes != null && bytes.Length > 0 || method == "POST")
+        {
             req.Method = "POST";
             req.ContentType = string.IsNullOrEmpty(contentType) ? "application/x-www-form-urlencoded" : contentType;
             if (bytes != null && bytes.Length > 0)
                 req.ContentLength = bytes.Length;
-            using (Stream outputStream = req.GetRequestStream()) {
+            using (Stream outputStream = req.GetRequestStream())
+            {
                 outputStream.Write(bytes, 0, bytes.Length);
             }
         }
+
         return req.GetResponse();
     }
 
@@ -389,7 +410,7 @@ public class proxy : IHttpHandler {
                     su.OAuth2Endpoint += "/";
                 log(TraceLevel.Info, "Service is secured by " + su.OAuth2Endpoint + ": getting new token...");
                 string uri = su.OAuth2Endpoint + "token?client_id=" + su.ClientId + "&client_secret=" + su.ClientSecret + "&grant_type=client_credentials&f=json";
-                string tokenResponse = webResponseToString(doHTTPRequest(uri, "POST"));
+                string tokenResponse = webResponseToString(doHTTPRequest(uri, "POST", su.UseProxyServer));
                 token = extractToken(tokenResponse, "token");
                 if (!string.IsNullOrEmpty(token))
                     token = exchangePortalTokenForServerToken(token, su);
@@ -398,7 +419,7 @@ public class proxy : IHttpHandler {
 
                 //if a request is already being made to generate a token, just let it go
                 if (reqUrl.ToLower().Contains("/generatetoken")) {
-                    string tokenResponse = webResponseToString(doHTTPRequest(reqUrl, "POST"));
+                    string tokenResponse = webResponseToString(doHTTPRequest(reqUrl, "POST", su.UseProxyServer));
                     token = extractToken(tokenResponse, "token");
                     return token;
                 }           
@@ -419,14 +440,14 @@ public class proxy : IHttpHandler {
                     log(TraceLevel.Info," Querying security endpoint...");
                     infoUrl += "/rest/info?f=json";
                     //lets send a request to try and determine the URL of a token generator
-                    string infoResponse = webResponseToString(doHTTPRequest(infoUrl, "GET"));
+                    string infoResponse = webResponseToString(doHTTPRequest(infoUrl, "GET", su.UseProxyServer));
                     String tokenServiceUri = getJsonValue(infoResponse, "tokenServicesUrl");
                     if (string.IsNullOrEmpty(tokenServiceUri))
                         tokenServiceUri = getJsonValue(infoResponse, "tokenServiceUrl");
                     if (tokenServiceUri != "") {
                         log(TraceLevel.Info," Service is secured by " + tokenServiceUri + ": getting new token...");
                         string uri = tokenServiceUri + "?f=json&request=getToken&referer=" + PROXY_REFERER + "&expiration=60&username=" + su.Username + "&password=" + su.Password;
-                        string tokenResponse = webResponseToString(doHTTPRequest(uri, "POST"));
+                        string tokenResponse = webResponseToString(doHTTPRequest(uri, "POST", su.UseProxyServer));
                         token = extractToken(tokenResponse, "token");
                     }
                 }
@@ -442,7 +463,7 @@ public class proxy : IHttpHandler {
         log(TraceLevel.Info," Exchanging Portal token for Server-specific token for " + su.Url + "...");
         string uri = su.OAuth2Endpoint.Substring(0, su.OAuth2Endpoint.IndexOf("/oauth2/", StringComparison.OrdinalIgnoreCase)) +
              "/generateToken?token=" + portalToken + "&serverURL=" + su.Url + "&f=json";
-        string tokenResponse = webResponseToString(doHTTPRequest(uri, "GET"));
+        string tokenResponse = webResponseToString(doHTTPRequest(uri, "GET", su.UseProxyServer));
         return extractToken(tokenResponse, "token");
     }
 
@@ -677,6 +698,7 @@ public class ServerUrl {
     string tokenParamName;
     string rateLimit;
     string rateLimitPeriod;
+    bool useProxyServer;
     
     [XmlAttribute("url")]
     public string Url {
@@ -732,5 +754,11 @@ public class ServerUrl {
     public int RateLimitPeriod {
         get { return string.IsNullOrEmpty(rateLimitPeriod)? 60 : int.Parse(rateLimitPeriod); }
         set { rateLimitPeriod = value.ToString(); }
+    }
+    [XmlAttribute("useProxyServer")]
+    public bool UseProxyServer
+    {
+        get { return useProxyServer; }
+        set { useProxyServer = value; }
     }
 }

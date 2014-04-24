@@ -18,6 +18,7 @@
                                     <xs:attribute name="accessToken" type="xs:string" use="optional" />
                                     <xs:attribute name="rateLimit" type="xs:integer" use="optional" />
                                     <xs:attribute name="rateLimitPeriod" type="xs:integer" use="optional" />
+                                    <xs:attribute name="useProxyServer" type="xs:boolean" use="required" />
                                 </xs:complexType>
                             </xs:element>
                         </xs:sequence>
